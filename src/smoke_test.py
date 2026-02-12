@@ -1,144 +1,106 @@
-import argparse
-import json
-from pathlib import Path
-
+import os
 import torch
-import torch.nn as nn
+import pandas as pd
 from PIL import Image
-from torchvision import models, transforms
+from torchvision import transforms
 
 
-def build_transform(img_size=224):
-    return transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
-    ])
+def simple_test():
+    print("--------------------------------------------------")
+    print("🚀 开始最终调试 (Final Debug)...")
+
+    # 1. 自动定位数据路径
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    excel_path = os.path.join(base_dir, 'data', 'HP_WSI-CoordAnnotatedAllPatches.xlsx')
+    img_dir = os.path.join(base_dir, 'data', '../data/images')
+
+    # 2. 检查 Excel
+    if not os.path.exists(excel_path):
+        print(f"❌ 错误: 找不到 Excel 文件: {excel_path}")
+        return
+
+    print(f"✅ Excel 读取成功")
+    df = pd.read_excel(excel_path)
+
+    # 3. 关键诊断：看看你的文件夹里到底有什么
+    print("--------------------------------------------------")
+    print(f"📂 你的 data/images 文件夹位置: {img_dir}")
+    if not os.path.exists(img_dir):
+        print("❌ 严重错误：images 文件夹不存在！请检查新建文件夹步骤。")
+        return
+
+    files_in_dir = os.listdir(img_dir)
+    print(f"👀 里面有的前 5 个东西: {files_in_dir[:5]}")
+    print("--------------------------------------------------")
+
+    # 4. 开始匹配
+    print("🔍 正在尝试匹配图片...")
+    found_count = 0
+
+    for idx, row in df.iterrows():
+        # 获取必要信息
+        pat_id = row['Pat_ID']  # 例如 B22-77
+        section_id = row['Section_ID']  # 例如 0 或 1
+        window_id = row['Window_ID']  # 例如 0
+
+        img_name = f"{window_id}.png"
+
+        # 可能性 A: 图片在子文件夹里 (标准结构: data/images/B22-77_0/0.png)
+        folder_name = f"{pat_id}_{section_id}"
+        path_a = os.path.join(img_dir, folder_name, img_name)
+
+        # 可能性 B: 图片直接散落在 images 里 (扁平结构: data/images/0.png)
+        path_b = os.path.join(img_dir, img_name)
+
+        # 可能性 C: 文件夹名字只有 ID (data/images/B22-77/0.png)
+        path_c = os.path.join(img_dir, str(pat_id), img_name)
+
+        final_path = None
+        if os.path.exists(path_a):
+            final_path = path_a
+        elif os.path.exists(path_b):
+            final_path = path_b
+        elif os.path.exists(path_c):
+            final_path = path_c
+
+        if final_path:
+            print(f"✅ 找到一张! 路径: {final_path}")
+            # 测试读取一张就够了，顺便测试 PyTorch
+            try:
+                img = Image.open(final_path).convert('RGB')
+                t = transforms.ToTensor()(img)
+                print(f"✨ PyTorch 读取成功，形状: {t.shape}")
+                print("\n🎉 太棒了！代码和数据终于连通了！")
+                return  # 成功退出
+            except Exception as e:
+                print(f"❌ 坏了，文件虽在但读不了: {e}")
+                return
+
+    # 如果循环跑完了还没 return，说明一张都没找到
+    print("\n⚠️ 匹配失败。")
+    print("请看上面的 '你的 data/images 文件夹位置' 和 '里面有的东西'")
+    print("确保你下载的图片 (比如 0.png) 确实在那个 Excel 里有记录。")
+    print("提示：你可能只下载了 B22-77_0 文件夹，但 Excel 前几行全是 B22-01_1 的数据。")
+    print("程序会继续往后扫 Excel，直到找到你下载的那部分数据...")
+
+    # 再次尝试：暴力搜索 Excel 里有没有任何一张图在你文件夹里
+    print("\n🔄 正在暴力搜索匹配（可能需要几秒钟）...")
+    all_downloaded_files = set(files_in_dir)  # 假设是散落的
+    # 如果是文件夹，就看文件夹里的
+    for f in files_in_dir:
+        sub_path = os.path.join(img_dir, f)
+        if os.path.isdir(sub_path):
+            print(f"   -> 扫描子文件夹: {f}")
+            sub_files = os.listdir(sub_path)
+            # 检查 Excel 里有没有这个文件夹的数据
+            subset = df[df['Pat_ID'].astype(str) + '_' + df['Section_ID'].astype(str) == f]
+            if not subset.empty:
+                print(f"   ✅ 发现 Excel 里有关于文件夹 {f} 的记录！")
+                print("      请检查里面图片名字是否匹配，例如 Excel 说有 0.png")
+                return
+            else:
+                print(f"   ⚠️ 警告: 你下载了文件夹 {f}，但 Excel 里好像没有这个 ID 的记录？")
 
 
-def load_one(path: str, tfm):
-    img = Image.open(path).convert("RGB")
-    return tfm(img)  # [3, H, W]
-
-
-def set_seed(seed: int):
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def main():
-    p = argparse.ArgumentParser()
-    # quick mode (2 images)
-    p.add_argument("--img1", type=str, default=None)
-    p.add_argument("--img2", type=str, default=None)
-    p.add_argument("--label1", type=int, default=0, choices=[0, 1])
-    p.add_argument("--label2", type=int, default=1, choices=[0, 1])
-
-    # json mode (closer to real pipeline)
-    # format: [{"path": "...", "label": 0/1, "patient_id": "P001"}, ...]
-    p.add_argument("--items_json", type=str, default=None)
-
-    p.add_argument("--img_size", type=int, default=224)
-    p.add_argument("--outdir", type=str, default="outputs/smoke")
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--seed", type=int, default=42)
-    args = p.parse_args()
-
-    set_seed(args.seed)
-    outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-    device = torch.device(args.device)
-
-    # Build sample list
-    items = []
-    if args.items_json:
-        items = json.loads(Path(args.items_json).read_text(encoding="utf-8"))
-    else:
-        if not args.img1:
-            raise ValueError("Provide --img1/--img2 or --items_json")
-        items.append({"path": args.img1, "label": args.label1, "patient_id": "P_demo_1"})
-        if args.img2:
-            items.append({"path": args.img2, "label": args.label2, "patient_id": "P_demo_2"})
-
-    # Tiny split to mimic your 'train/val/test ratio' idea
-    # (for smoke test only; real split will be patient-level)
-    train_items = items[: max(1, len(items) - 1)]
-    test_items = items[-1:]
-
-    tfm = build_transform(args.img_size)
-
-    # Model
-    model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-    model.fc = nn.Linear(model.fc.in_features, 2)
-    model.to(device)
-
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-
-    # ---- Train (one batch) ----
-    model.train()
-    xs, ys = [], []
-    for it in train_items:
-        xs.append(load_one(it["path"], tfm))
-        ys.append(it["label"])
-    x = torch.stack(xs, dim=0).to(device)                 # [B, 3, H, W]
-    y = torch.tensor(ys, dtype=torch.long, device=device)  # [B]
-
-    logits = model(x)                 # [B, 2]
-    loss = criterion(logits, y)
-
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-
-    train_probs = torch.softmax(logits.detach().cpu(), dim=1).numpy().tolist()
-    train_preds = torch.argmax(logits.detach().cpu(), dim=1).numpy().tolist()
-
-    print(f"[TRAIN] batch_shape={tuple(x.shape)} loss={float(loss.item()):.6f}")
-    for i, it in enumerate(train_items):
-        print(f"  - {it['path']} label={it['label']} pred={train_preds[i]} "
-              f"prob_pos={train_probs[i][1]:.4f}")
-
-    # ---- Eval (test) ----
-    model.eval()
-    test_out = []
-    with torch.no_grad():
-        for it in test_items:
-            x1 = load_one(it["path"], tfm).unsqueeze(0).to(device)  # [1,3,H,W]
-            logit1 = model(x1)
-            prob1 = torch.softmax(logit1.cpu(), dim=1).numpy().tolist()[0]
-            pred1 = int(torch.argmax(logit1.cpu(), dim=1).item())
-            test_out.append({
-                "path": it["path"],
-                "label": int(it["label"]),
-                "pred": pred1,
-                "prob_neg": prob1[0],
-                "prob_pos": prob1[1],
-                "patient_id": it.get("patient_id", ""),
-            })
-            print(f"[TEST] {it['path']} label={it['label']} pred={pred1} prob_pos={prob1[1]:.4f}")
-
-    # Save artifacts
-    torch.save(
-        {"model_state_dict": model.state_dict(), "img_size": args.img_size, "seed": args.seed},
-        outdir / "model.ckpt",
-    )
-
-    metrics = {
-        "train_loss": float(loss.item()),
-        "num_train": len(train_items),
-        "num_test": len(test_items),
-        "note": "Smoke test only. Real training uses patient-level split and full dataloader.",
-    }
-    (outdir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    (outdir / "preds.json").write_text(json.dumps(test_out, indent=2, ensure_ascii=False), encoding="utf-8")
-
-    print(f"\nSaved: {outdir/'model.ckpt'}")
-    print(f"Saved: {outdir/'metrics.json'}")
-    print(f"Saved: {outdir/'preds.json'}")
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    simple_test()
