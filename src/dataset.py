@@ -8,97 +8,85 @@ from PIL import Image
 class HPyloriDataset(Dataset):
     def __init__(self, excel_path, img_root_dir, transform=None, local_debug=True):
         """
-        :param excel_path: Excel 文件路径
-        :param img_root_dir: 图片存储根目录 (data/images)
-        :param transform: 图像预处理变换
-        :param local_debug: 如果为 True，将只保留本地硬盘里确实存在的图片，防止训练崩溃
+        :param excel_path: Excel 索引文件路径
+        :param img_root_dir: 图片文件夹根目录
+        :param local_debug:
+            True = 本地模式（只加载硬盘里有的几张图，适合调试）
+            False = 服务器模式（加载 Excel 里所有有标注的图，约21万张）
         """
         self.img_root_dir = img_root_dir
         self.transform = transform
+        self.local_debug = local_debug
 
-        # 1. 加载 Excel
+        # 1. 读取 Excel
         if not os.path.exists(excel_path):
             raise FileNotFoundError(f"❌ 找不到 Excel 文件: {excel_path}")
 
-        print(f"📖 正在读取索引文件...")
+        print(f"📖 正在读取索引文件: {excel_path} ...")
         df = pd.read_excel(excel_path)
 
-        # 2. 标签预处理: 只保留 1 (阳性) 和 -1 (阴性)
-        # 顺便把 -1 映射为 0，因为 PyTorch 的分类标签通常要求从 0 开始
+        # 2. 核心过滤：只保留有明确标注的行 (1=有菌, -1=无菌)
+        # 这一步解决了“没有答案训练不起来”的问题
         if 'Presence' in df.columns:
             df = df[df['Presence'].isin([1, -1])].copy()
+            # 将 -1 (无菌) 转换为 0，1 (有菌) 保持为 1
             df['label'] = df['Presence'].apply(lambda x: 1 if x == 1 else 0)
         else:
-            raise ValueError("❌ Excel 中缺少必要的 'Presence' 列")
+            raise ValueError("❌ Excel 中缺少 'Presence' 列，无法训练！")
 
-        # 3. 本地调试模式：过滤掉没下载的图片
+        # 3. 本地调试逻辑
         if local_debug:
-            print("🔍 本地调试模式：正在扫描硬盘，剔除未下载的样本...")
-            valid_mask = []
+            print("🔍 [本地模式] 正在扫描硬盘，剔除未下载的图片...")
+            valid_rows = []
             for _, row in df.iterrows():
-                # 尝试匹配你目前的扁平化路径 (直接放在 images 下)
-                img_path = os.path.join(self.img_root_dir, f"{row['Window_ID']}.png")
-                # 如果未来你用了文件夹结构，可以增加判断：
-                # folder_path = os.path.join(self.img_root_dir, f"{row['Pat_ID']}_{row['Section_ID']}", f"{row['Window_ID']}.png")
-                valid_mask.append(os.path.exists(img_path))
+                # 检查图片是否存在（支持两种常见的路径结构）
+                if self._check_path(row):
+                    valid_rows.append(row)
 
-            df = df[valid_mask].reset_index(drop=True)
-            print(f"✅ 扫描完成！本地可用样本数: {len(df)}")
+            df = pd.DataFrame(valid_rows).reset_index(drop=True)
+            print(f"✅ [本地模式] 过滤完成，实际可用样本数: {len(df)}")
         else:
+            # 服务器模式：直接信任 Excel，不再逐一检查硬盘（为了速度）
             df = df.reset_index(drop=True)
-            print(f"🚀 全量模式：总样本数: {len(df)}")
+            print(f"🚀 [服务器模式] 加载全量数据，计划训练样本数: {len(df)}")
 
         self.data = df
+
+    def _check_path(self, row):
+        """辅助函数：检查图片路径是否存在"""
+        # 尝试路径 1: data/images/Window_ID.png (扁平结构)
+        path1 = os.path.join(self.img_root_dir, f"{row['Window_ID']}.png")
+        if os.path.exists(path1): return True
+
+        # 尝试路径 2: data/images/Pat_ID_Section_ID/Window_ID.png (层级结构)
+        folder_name = f"{row['Pat_ID']}_{row['Section_ID']}"
+        path2 = os.path.join(self.img_root_dir, folder_name, f"{row['Window_ID']}.png")
+        if os.path.exists(path2): return True
+
+        return False
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
-
-        # 获取图片 ID
-        window_id = row['Window_ID']
         label = row['label']
+        img_name = f"{row['Window_ID']}.png"
 
-        # 拼接图片路径
-        # 注意：这里优先匹配你目前拖进 images 文件夹的扁平结构
-        img_name = f"{window_id}.png"
+        # 动态寻找图片路径 (优先找扁平结构，再找文件夹结构)
         img_path = os.path.join(self.img_root_dir, img_name)
-
-        # 如果主路径找不到，尝试子文件夹结构 (为了兼容服务器)
         if not os.path.exists(img_path):
             folder_name = f"{row['Pat_ID']}_{row['Section_ID']}"
             img_path = os.path.join(self.img_root_dir, folder_name, img_name)
 
         try:
-            # 读取并转为 RGB (防止有灰度图干扰)
             image = Image.open(img_path).convert('RGB')
-        except Exception as e:
-            # 极端情况：如果文件损坏或丢失，返回一张黑图占位
-            print(f"⚠️ 读取失败: {img_path}")
+        except Exception:
+            # 万一图片损坏，返回一张全黑图片防止训练中断
+            # print(f"⚠️ 图片读取失败: {img_path}") # 只有调试时才打开这个打印
             image = Image.new('RGB', (224, 224))
 
         if self.transform:
             image = self.transform(image)
 
         return image, torch.tensor(label, dtype=torch.long)
-
-
-# ---------------------------------------------------------
-# 下面这段代码只有当你直接运行 python dataset.py 时才会执行，用于快速自检
-if __name__ == '__main__':
-    print("🧪 正在自检 dataset.py...")
-    # 这里的路径根据你的 PyCharm 结构自动推断
-    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    test_excel = os.path.join(base, 'data', 'HP_WSI-CoordAnnotatedAllPatches.xlsx')
-    test_imgs = os.path.join(base, 'data', 'images')
-
-    try:
-        ds = HPyloriDataset(test_excel, test_imgs, local_debug=True)
-        if len(ds) > 0:
-            img, lbl = ds[0]
-            print(f"✅ 自检成功！第一张图尺寸: {img.size}, 标签: {lbl}")
-        else:
-            print("⚠️ 警告：没找到任何本地图片，请检查 data/images 文件夹。")
-    except Exception as e:
-        print(f"❌ 自检失败: {e}")
