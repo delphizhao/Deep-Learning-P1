@@ -1,169 +1,190 @@
 import argparse
-from pathlib import Path
-
-import numpy as np
 import pandas as pd
+from pathlib import Path
+import numpy as np
 
 
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--data_root", type=str, required=True,
-                   help="Root dir containing patient folders like B22-83_1/0.png")
-    p.add_argument("--xlsx", type=str, default="data/HP_WSI-CoordAnnotatedAllPatches.xlsx",
-                   help="Excel with patch annotations: Pat_ID, Section_ID, Window_ID, Presence")
-    p.add_argument("--patient_csv", type=str, default="data/PatientDiagnosis.csv",
-                   help="PatientDiagnosis.csv: CODI + diagnosis (NEGATIVA/BAIXA/ALTA)")
-    p.add_argument("--out_dir", type=str, default="splits", help="Output directory")
-    p.add_argument("--seed", type=int, default=42)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        required=True,
+        help="Root folder of cropped images, e.g. CrossValidation/Cropped",
+    )
+    parser.add_argument(
+        "--xlsx",
+        type=str,
+        required=True,
+        help="Annotation Excel file",
+    )
+    parser.add_argument(
+        "--patient_csv",
+        type=str,
+        default="data/PatientDiagnosis.csv",
+        help="Patient-level diagnosis CSV (optional)",
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default="splits",
+        help="Output directory for split CSVs",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    return parser.parse_args()
 
-    p.add_argument("--train", type=float, default=0.7)
-    p.add_argument("--val", type=float, default=0.15)
-    p.add_argument("--test", type=float, default=0.15)
 
-    # for quick debug only
-    p.add_argument("--limit_patients", type=int, default=0,
-                   help="If >0, only use this many patients (debug)")
-    return p.parse_args()
+# -------------------------
+# build relative image path
+# -------------------------
+def make_rel_path(row):
+    pat = str(row["Pat_ID"]).strip()
+    sec = int(float(row["Section_ID"]))
+    wid = str(row["Window_ID"]).strip()
+
+    # 去掉 .0
+    if wid.endswith(".0"):
+        wid = wid[:-2]
+
+    # 确保 .png
+    if not wid.lower().endswith(".png"):
+        wid = f"{wid}.png"
+
+    return f"{pat}_{sec}/{wid}"
 
 
-def patient_stratified_split(diag_df: pd.DataFrame, train_r: float, val_r: float, test_r: float, seed: int):
-    assert abs(train_r + val_r + test_r - 1.0) < 1e-6, "train+val+test must sum to 1.0"
-    rng = np.random.default_rng(seed)
+# -------------------------
+# patch-level split fallback
+# -------------------------
+def patch_level_split(df, seed=42, train_ratio=0.7, val_ratio=0.15):
+    rng = np.random.RandomState(seed)
+    idx = np.arange(len(df))
+    rng.shuffle(idx)
 
-    train_ids, val_ids, test_ids = [], [], []
-    for label in sorted(diag_df["patient_label"].unique()):
-        sub = diag_df[diag_df["patient_label"] == label].copy()
-        ids = sub["patient_id"].tolist()
-        rng.shuffle(ids)
+    n = len(df)
+    n_train = int(n * train_ratio)
+    n_val = int(n * val_ratio)
 
-        n = len(ids)
-        n_train = int(round(n * train_r))
-        n_val = int(round(n * val_r))
-        n_train = min(n_train, n)
-        n_val = min(n_val, n - n_train)
-        n_test = n - n_train - n_val
+    train_idx = idx[:n_train]
+    val_idx = idx[n_train : n_train + n_val]
+    test_idx = idx[n_train + n_val :]
 
-        train_ids += ids[:n_train]
-        val_ids += ids[n_train:n_train + n_val]
-        test_ids += ids[n_train + n_val:]
-
-        print(f"[INFO] patient_label={label}: total={n} -> train={n_train}, val={n_val}, test={n_test}")
-
-    rng.shuffle(train_ids)
-    rng.shuffle(val_ids)
-    rng.shuffle(test_ids)
-    return train_ids, val_ids, test_ids
+    return (
+        df.iloc[train_idx].copy(),
+        df.iloc[val_idx].copy(),
+        df.iloc[test_idx].copy(),
+    )
 
 
 def main():
     args = parse_args()
+
     data_root = Path(args.data_root)
+    xlsx_path = Path(args.xlsx)
+    patient_csv = Path(args.patient_csv)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    xlsx_path = Path(args.xlsx)
-    patient_csv_path = Path(args.patient_csv)
-    if not patient_csv_path.exists():
-        print(f"[WARN] PatientDiagnosis.csv not found: {patient_csv_path}")
-        print("[WARN] Fallback: do PATCH-LEVEL random split (NOT patient-level).")
-        diag = None
-    else:
-        diag = pd.read_csv(patient_csv_path)
-        diag = diag.rename(columns={"CODI": "patient_id"})
-        diag["patient_label"] = diag.iloc[:, 1].map(lambda x: 0 if str(x).upper().startswith("NEG") else 1)
+    # -------------------------
+    # load Excel
+    # -------------------------
+    if not xlsx_path.exists():
+        raise FileNotFoundError(f"Excel not found: {xlsx_path}")
 
+    print(f"[INFO] Reading Excel: {xlsx_path}")
     df = pd.read_excel(xlsx_path)
 
-    required = {"Pat_ID", "Section_ID", "Window_ID", "Presence"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Excel missing columns: {missing}")
+    # -------------------------
+    # keep labeled patches only
+    # -------------------------
+    if "Presence" not in df.columns:
+        raise ValueError("Excel missing column: Presence")
 
-    # keep labeled only
     df = df[df["Presence"].isin([1, -1])].copy()
     df["label"] = (df["Presence"] == 1).astype(int)
 
-    # Cropped folder structure: Pat_ID_SectionID/Window_ID.png
-    def make_rel_path(row):
-        pat = str(row["Pat_ID"]).strip()
+    print(f"[INFO] labeled patches: {len(df)}")
 
-        # Section_ID 可能是 0/1，也可能是 0.0/1.0
-        sec = row["Section_ID"]
-        try:
-            sec = int(float(sec))
-        except Exception:
-            sec = str(sec).strip()
-
-        wid = str(row["Window_ID"]).strip()
-        # 去掉小数点形式（比如 902.0）
-        if wid.endswith(".0"):
-            wid = wid[:-2]
-
-        fname = wid if wid.lower().endswith(".png") else f"{wid}.png"
-        folder = f"{pat}_{sec}"
-        return str(Path(folder) / fname)
-
+    # -------------------------
+    # build paths
+    # -------------------------
     df["rel_path"] = df.apply(make_rel_path, axis=1)
     df["path"] = df["rel_path"].apply(lambda p: str(data_root / p))
 
-    df["patient_id"] = df["Pat_ID"].astype(str)
-    df["section_id"] = df["Section_ID"].astype(int)
-    df["window_id"] = df["Window_ID"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
-    df["source"] = "annotated_excel"
+    # check existence
+    exists = df["path"].apply(lambda p: Path(p).exists())
+    print(f"[INFO] existing image files: {exists.sum()} / {len(df)}")
 
-    print(f"[INFO] labeled patches: {len(df)}")
-    print(f"[INFO] patch patients: {df['patient_id'].nunique()}")
+    if exists.sum() == 0:
+        print("[WARN] 0 images found. Check --data_root")
+        print("[WARN] example path:", df["path"].iloc[0])
+    else:
+        missing = df.loc[~exists, "path"].head(5).tolist()
+        if missing:
+            print("[INFO] example missing paths:")
+            for m in missing:
+                print(" -", m)
 
-    patient_csv = Path(args.patient_csv)
+    df = df[exists].reset_index(drop=True)
+
+    # -------------------------
+    # try patient-level CSV
+    # -------------------------
     if not patient_csv.exists():
-        raise FileNotFoundError(f"PatientDiagnosis.csv not found: {patient_csv}")
+        print(f"[WARN] PatientDiagnosis.csv not found: {patient_csv}")
+        print("[WARN] Fallback to PATCH-LEVEL split")
+        diag = None
+    else:
+        print(f"[INFO] Reading patient CSV: {patient_csv}")
+        diag = pd.read_csv(patient_csv)
 
-    diag = pd.read_csv(patient_csv)
-    if "CODI" not in diag.columns:
-        raise ValueError("PatientDiagnosis.csv must contain column 'CODI'")
+        if "CODI" not in diag.columns:
+            raise ValueError("PatientDiagnosis.csv must have column 'CODI'")
 
-    diag = diag.rename(columns={"CODI": "patient_id"})
-    diag["patient_id"] = diag["patient_id"].astype(str)
-    diag["patient_label"] = diag.iloc[:, 1].map(lambda x: 0 if str(x).upper().startswith("NEG") else 1)
-    diag = diag[["patient_id", "patient_label"]].drop_duplicates()
+        diag = diag.rename(columns={"CODI": "patient_id"})
+        diag["patient_id"] = diag["patient_id"].astype(str)
 
-    # intersection only
-    diag = diag[diag["patient_id"].isin(df["patient_id"].unique())].copy()
-    print(f"[INFO] patients available for split: {diag['patient_id'].nunique()}")
+        diag["patient_label"] = diag.iloc[:, 1].map(
+            lambda x: 0 if str(x).upper().startswith("NEG") else 1
+        )
 
-    if args.limit_patients and args.limit_patients > 0:
-        diag = diag.sample(n=min(args.limit_patients, len(diag)), random_state=args.seed).copy()
-        df = df[df["patient_id"].isin(diag["patient_id"])].copy()
-        print(f"[DEBUG] limit_patients={args.limit_patients} -> patches={len(df)}")
+        print(f"[INFO] patients in CSV: {diag['patient_id'].nunique()}")
 
-    train_ids, val_ids, test_ids = patient_stratified_split(diag, args.train, args.val, args.test, args.seed)
+    # -------------------------
+    # split
+    # -------------------------
+    if diag is None:
+        train_df, val_df, test_df = patch_level_split(df, seed=args.seed)
+    else:
+        df["patient_id"] = df["Pat_ID"].astype(str)
+        patients = df["patient_id"].unique()
 
-    train_df = df[df["patient_id"].isin(train_ids)].copy()
-    val_df = df[df["patient_id"].isin(val_ids)].copy()
-    test_df = df[df["patient_id"].isin(test_ids)].copy()
+        rng = np.random.RandomState(args.seed)
+        rng.shuffle(patients)
 
-    # sample existence check (fast)
-    sample_paths = pd.concat([train_df, val_df, test_df]).sample(n=min(50, len(df)), random_state=args.seed)["path"].tolist()
-    exist_cnt = sum(Path(p).exists() for p in sample_paths)
-    print(f"[INFO] sampled path existence: {exist_cnt}/{len(sample_paths)}")
+        n = len(patients)
+        n_train = int(0.7 * n)
+        n_val = int(0.15 * n)
 
-    cols = ["path", "label", "patient_id", "section_id", "window_id", "source"]
-    (out_dir / "train.csv").write_text(train_df[cols].to_csv(index=False), encoding="utf-8")
-    (out_dir / "val.csv").write_text(val_df[cols].to_csv(index=False), encoding="utf-8")
-    (out_dir / "test.csv").write_text(test_df[cols].to_csv(index=False), encoding="utf-8")
+        train_p = set(patients[:n_train])
+        val_p = set(patients[n_train : n_train + n_val])
+        test_p = set(patients[n_train + n_val :])
 
-    train_neg_df = train_df[train_df["label"] == 0].copy()
-    (out_dir / "train_neg.csv").write_text(train_neg_df[cols].to_csv(index=False), encoding="utf-8")
+        train_df = df[df["patient_id"].isin(train_p)]
+        val_df = df[df["patient_id"].isin(val_p)]
+        test_df = df[df["patient_id"].isin(test_p)]
 
-    def report(name, d):
-        pos = int((d["label"] == 1).sum())
-        neg = int((d["label"] == 0).sum())
-        print(f"[INFO] {name}: patches={len(d)} pos={pos} neg={neg} patients={d['patient_id'].nunique()}")
+    # -------------------------
+    # save
+    # -------------------------
+    train_df.to_csv(out_dir / "train.csv", index=False)
+    val_df.to_csv(out_dir / "val.csv", index=False)
+    test_df.to_csv(out_dir / "test.csv", index=False)
 
-    report("train", train_df)
-    report("val", val_df)
-    report("test", test_df)
-    print(f"[OK] wrote splits to: {out_dir.resolve()}")
+    print("[INFO] split done")
+    print(f"  train: {len(train_df)}")
+    print(f"  val  : {len(val_df)}")
+    print(f"  test : {len(test_df)}")
 
 
 if __name__ == "__main__":
