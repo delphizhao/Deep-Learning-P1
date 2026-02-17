@@ -62,8 +62,15 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     xlsx_path = Path(args.xlsx)
-    if not xlsx_path.exists():
-        raise FileNotFoundError(f"Excel not found: {xlsx_path}")
+    patient_csv_path = Path(args.patient_csv)
+    if not patient_csv_path.exists():
+        print(f"[WARN] PatientDiagnosis.csv not found: {patient_csv_path}")
+        print("[WARN] Fallback: do PATCH-LEVEL random split (NOT patient-level).")
+        diag = None
+    else:
+        diag = pd.read_csv(patient_csv_path)
+        diag = diag.rename(columns={"CODI": "patient_id"})
+        diag["patient_label"] = diag.iloc[:, 1].map(lambda x: 0 if str(x).upper().startswith("NEG") else 1)
 
     df = pd.read_excel(xlsx_path)
 
