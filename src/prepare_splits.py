@@ -9,9 +9,9 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data_root", type=str, required=True,
                    help="Root dir containing patient folders like B22-83_1/0.png")
-    p.add_argument("--xlsx", type=str, default="data/meta/HP_WSI-CoordAnnotatedAllPatches.xlsx",
+    p.add_argument("--xlsx", type=str, default="data/HP_WSI-CoordAnnotatedAllPatches.xlsx",
                    help="Excel with patch annotations: Pat_ID, Section_ID, Window_ID, Presence")
-    p.add_argument("--patient_csv", type=str, default="data/meta/PatientDiagnosis.csv",
+    p.add_argument("--patient_csv", type=str, default="data/PatientDiagnosis.csv",
                    help="PatientDiagnosis.csv: CODI + diagnosis (NEGATIVA/BAIXA/ALTA)")
     p.add_argument("--out_dir", type=str, default="splits", help="Output directory")
     p.add_argument("--seed", type=int, default=42)
