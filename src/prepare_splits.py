@@ -78,8 +78,15 @@ def main():
 
     # Cropped folder structure: Pat_ID_SectionID/Window_ID.png
     def make_rel_path(row):
-        folder = f"{row['Pat_ID']}_{int(row['Section_ID'])}"
-        fname = f"{int(row['Window_ID'])}.png"
+        folder = f"{str(row['Pat_ID']).strip()}_{int(float(row['Section_ID']))}"
+
+        wid = str(row["Window_ID"]).strip()
+        # 如果 Excel 里已经带 .png，就别重复加
+        if wid.lower().endswith(".png"):
+            fname = wid
+        else:
+            fname = f"{wid}.png"
+
         return str(Path(folder) / fname)
 
     df["rel_path"] = df.apply(make_rel_path, axis=1)
