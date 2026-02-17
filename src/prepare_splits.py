@@ -78,15 +78,22 @@ def main():
 
     # Cropped folder structure: Pat_ID_SectionID/Window_ID.png
     def make_rel_path(row):
-        folder = f"{str(row['Pat_ID']).strip()}_{int(float(row['Section_ID']))}"
+        pat = str(row["Pat_ID"]).strip()
+
+        # Section_ID 可能是 0/1，也可能是 0.0/1.0
+        sec = row["Section_ID"]
+        try:
+            sec = int(float(sec))
+        except Exception:
+            sec = str(sec).strip()
 
         wid = str(row["Window_ID"]).strip()
-        # 如果 Excel 里已经带 .png，就别重复加
-        if wid.lower().endswith(".png"):
-            fname = wid
-        else:
-            fname = f"{wid}.png"
+        # 去掉小数点形式（比如 902.0）
+        if wid.endswith(".0"):
+            wid = wid[:-2]
 
+        fname = wid if wid.lower().endswith(".png") else f"{wid}.png"
+        folder = f"{pat}_{sec}"
         return str(Path(folder) / fname)
 
     df["rel_path"] = df.apply(make_rel_path, axis=1)
@@ -94,7 +101,7 @@ def main():
 
     df["patient_id"] = df["Pat_ID"].astype(str)
     df["section_id"] = df["Section_ID"].astype(int)
-    df["window_id"] = df["Window_ID"].astype(int)
+    df["window_id"] = df["Window_ID"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
     df["source"] = "annotated_excel"
 
     print(f"[INFO] labeled patches: {len(df)}")
