@@ -1,153 +1,250 @@
+# src/train_cnn.py
+from __future__ import annotations
+
 import argparse
 import json
+import os
 from pathlib import Path
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import models, transforms
 
-from dataset_csv import CSVPatchDataset
-from metrics import compute_metrics
+from dataset_csv import HPTileCSVDataset
 
 
-def build_transforms(train: bool):
-    if train:
-        return transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(),
-            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05, hue=0.02),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
-    return transforms.Compose([
-        transforms.Resize((224, 224)),
+def set_seed(seed: int):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    import random
+    import numpy as np
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def build_transforms(img_size: int = 224):
+    train_tfm = transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02),
         transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
     ])
+    val_tfm = transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+    return train_tfm, val_tfm
 
 
-def make_model(name: str):
+def build_model(name: str, num_classes: int = 2, pretrained: bool = True) -> nn.Module:
     name = name.lower()
     if name == "resnet18":
-        m = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        model = models.resnet18(weights=weights)
     elif name == "resnet50":
-        m = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        weights = models.ResNet50_Weights.DEFAULT if pretrained else None
+        model = models.resnet50(weights=weights)
     else:
-        raise ValueError("model must be resnet18 or resnet50")
+        raise ValueError(f"Unknown model: {name}. Choose from: resnet18, resnet50")
 
-    in_features = m.fc.in_features
-    m.fc = nn.Linear(in_features, 2)
-    return m
+    in_features = model.fc.in_features
+    model.fc = nn.Linear(in_features, num_classes)
+    return model
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, criterion: nn.Module) -> Dict[str, float]:
     model.eval()
-    y_true, y_pred, y_prob = [], [], []
-    rows = []
+    total_loss = 0.0
+    correct = 0
+    total = 0
 
-    for x, y, patient_id in loader:
-        x = x.to(device)
-        y = y.to(device)
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
 
         logits = model(x)
-        prob = torch.softmax(logits, dim=1)[:, 1].detach().cpu().tolist()
-        pred = torch.argmax(logits, dim=1).detach().cpu().tolist()
-        yt = y.detach().cpu().tolist()
+        loss = criterion(logits, y)
 
-        y_true.extend(yt)
-        y_pred.extend(pred)
-        y_prob.extend(prob)
+        total_loss += float(loss.item()) * x.size(0)
+        pred = logits.argmax(dim=1)
+        correct += int((pred == y).sum().item())
+        total += int(x.size(0))
 
-        for pid, t, pprob, ppred in zip(patient_id, yt, prob, pred):
-            rows.append({"patient_id": pid, "label": int(t), "prob_pos": float(pprob), "pred": int(ppred)})
+    return {
+        "loss": total_loss / max(total, 1),
+        "acc": correct / max(total, 1),
+        "n": total,
+    }
 
-    metrics = compute_metrics(y_true, y_pred, y_prob)
-    return metrics, rows
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> Dict[str, float]:
+    model.train()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(x)
+        loss = criterion(logits, y)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += float(loss.item()) * x.size(0)
+        pred = logits.argmax(dim=1)
+        correct += int((pred == y).sum().item())
+        total += int(x.size(0))
+
+    return {
+        "loss": total_loss / max(total, 1),
+        "acc": correct / max(total, 1),
+        "n": total,
+    }
+
+
+def save_ckpt(path: Path, model: nn.Module, optimizer: torch.optim.Optimizer, meta: Dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "meta": meta,
+    }, path)
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--train_csv", type=str, required=True)
-    ap.add_argument("--val_csv", type=str, required=True)
-    ap.add_argument("--model", type=str, default="resnet18", choices=["resnet18", "resnet50"])
-    ap.add_argument("--epochs", type=int, default=10)
-    ap.add_argument("--batch_size", type=int, default=32)
-    ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--num_workers", type=int, default=4)
-    ap.add_argument("--out_dir", type=str, default="outputs/cnn")
-    ap.add_argument("--seed", type=int, default=42)
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
 
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+    parser.add_argument("--train_csv", type=str, required=True)
+    parser.add_argument("--val_csv", type=str, required=True)
+    parser.add_argument("--test_csv", type=str, default=None)
+
+    # Optional: only needed if your CSV DOES NOT have "path" and only has "rel_path"
+    parser.add_argument("--img_root", type=str, default=None)
+
+    parser.add_argument("--model", type=str, default="resnet18", choices=["resnet18", "resnet50"])
+    parser.add_argument("--pretrained", action="store_true", help="Use ImageNet pretrained backbone")
+
+    parser.add_argument("--img_size", type=int, default=224)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument("--out_dir", type=str, default="runs/train_cnn")
+    parser.add_argument("--strict", action="store_true", help="Error if any file missing/unreadable")
+
+    args = parser.parse_args()
+
+    set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    out_dir = Path(args.out_dir)
+    print(f"[INFO] device = {device}")
+    if device.type == "cuda":
+        print(f"[INFO] cuda device = {torch.cuda.get_device_name(0)}")
+        torch.backends.cudnn.benchmark = True
+
+    out_dir = Path(args.out_dir) / f"{args.model}_seed{args.seed}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[INFO] out_dir = {out_dir}")
 
-    train_ds = CSVPatchDataset(args.train_csv, transform=build_transforms(train=True))
-    val_ds = CSVPatchDataset(args.val_csv, transform=build_transforms(train=False))
+    train_tfm, val_tfm = build_transforms(args.img_size)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.num_workers, pin_memory=True)
+    train_ds = HPTileCSVDataset(args.train_csv, img_root=args.img_root, transform=train_tfm, strict=args.strict)
+    val_ds = HPTileCSVDataset(args.val_csv, img_root=args.img_root, transform=val_tfm, strict=args.strict)
 
-    # class weights (handle imbalance)
-    labels = train_ds.df["label"].astype(int).tolist()
-    n_pos = sum(labels)
-    n_neg = len(labels) - n_pos
-    w_pos = n_neg / max(n_pos, 1)
-    weight = torch.tensor([1.0, float(w_pos)], device=device)
-    criterion = nn.CrossEntropyLoss(weight=weight)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
 
-    model = make_model(args.model).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    model = build_model(args.model, num_classes=2, pretrained=args.pretrained).to(device)
 
-    best_auc = -1.0
-    best_path = out_dir / "best_model.pth"
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+
+    best_val_acc = -1.0
+    history = []
 
     for epoch in range(1, args.epochs + 1):
-        model.train()
-        running = 0.0
+        tr = train_one_epoch(model, train_loader, device, criterion, optimizer)
+        va = evaluate(model, val_loader, device, criterion)
 
-        for x, y, _pid in train_loader:
-            x = x.to(device)
-            y = y.to(device)
+        row = {
+            "epoch": epoch,
+            "train_loss": tr["loss"],
+            "train_acc": tr["acc"],
+            "train_n": tr["n"],
+            "val_loss": va["loss"],
+            "val_acc": va["acc"],
+            "val_n": va["n"],
+        }
+        history.append(row)
 
-            optimizer.zero_grad()
-            logits = model(x)
-            loss = criterion(logits, y)
-            loss.backward()
-            optimizer.step()
-            running += float(loss.item())
+        print(
+            f"[E{epoch:02d}] "
+            f"train loss={row['train_loss']:.4f} acc={row['train_acc']:.4f} | "
+            f"val loss={row['val_loss']:.4f} acc={row['val_acc']:.4f}"
+        )
 
-        train_loss = running / max(len(train_loader), 1)
+        # save last
+        save_ckpt(out_dir / "last.pth", model, optimizer, meta={"args": vars(args), "epoch": epoch})
 
-        val_metrics, val_rows = evaluate(model, val_loader, device)
-        print(f"[E{epoch}] train_loss={train_loss:.4f} val={val_metrics}")
+        # save best
+        if row["val_acc"] > best_val_acc:
+            best_val_acc = row["val_acc"]
+            save_ckpt(out_dir / "best.pth", model, optimizer, meta={"args": vars(args), "epoch": epoch})
+            print(f"[INFO] best updated: val_acc={best_val_acc:.4f}")
 
-        if val_metrics["auc"] > best_auc:
-            best_auc = val_metrics["auc"]
-            torch.save(model.state_dict(), best_path)
-            (out_dir / "patch_preds_val.csv").write_text(
-                "\n".join(["patient_id,label,prob_pos,pred"] + [
-                    f"{r['patient_id']},{r['label']},{r['prob_pos']},{r['pred']}" for r in val_rows
-                ]),
-                encoding="utf-8",
-            )
-            with open(out_dir / "best_metrics.json", "w", encoding="utf-8") as f:
-                json.dump({"epoch": epoch, "train_loss": train_loss, **val_metrics}, f, indent=2)
-            print(f"[OK] saved best -> {best_path} (AUC={best_auc:.4f})")
+        # write metrics json every epoch
+        with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
+            json.dump({"best_val_acc": best_val_acc, "history": history}, f, indent=2)
 
-    print("[DONE] CNN training finished.")
-    print(f"Best model: {best_path}")
-    print(f"Val patch preds: {out_dir / 'patch_preds_val.csv'}")
+    # optional test
+    if args.test_csv is not None:
+        test_ds = HPTileCSVDataset(args.test_csv, img_root=args.img_root, transform=val_tfm, strict=args.strict)
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
+        ckpt = torch.load(out_dir / "best.pth", map_location="cpu")
+        model.load_state_dict(ckpt["model_state"])
+        te = evaluate(model, test_loader, device, criterion)
+        print(f"[TEST] loss={te['loss']:.4f} acc={te['acc']:.4f} n={te['n']}")
+        with open(out_dir / "test.json", "w", encoding="utf-8") as f:
+            json.dump(te, f, indent=2)
 
 
 if __name__ == "__main__":
