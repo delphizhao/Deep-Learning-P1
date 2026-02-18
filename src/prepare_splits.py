@@ -2,6 +2,7 @@ import argparse
 import pandas as pd
 from pathlib import Path
 import numpy as np
+from collections import defaultdict
 
 
 def parse_args():
@@ -31,6 +32,11 @@ def parse_args():
         help="Output directory for split CSVs",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--strict_paths",
+        action="store_true",
+        help="Only trust canonical {Pat_ID}_{Section_ID}/{Window_ID}.png paths (disable fallback search).",
+    )
     return parser.parse_args()
 
 
@@ -39,7 +45,8 @@ def parse_args():
 # -------------------------
 def make_rel_path(row):
     pat = str(row["Pat_ID"]).strip()
-    sec = int(float(row["Section_ID"]))
+    sec_raw = str(row["Section_ID"]).strip()
+    sec = sec_raw[:-2] if sec_raw.endswith(".0") else sec_raw
     wid = str(row["Window_ID"]).strip()
 
     # 去掉 .0
@@ -51,6 +58,37 @@ def make_rel_path(row):
         wid = f"{wid}.png"
 
     return f"{pat}_{sec}/{wid}"
+
+
+def build_file_index(data_root: Path):
+    """Index png files to improve hit-rate when folder layout differs from canonical rel_path."""
+    by_rel = {}
+    by_basename = defaultdict(list)
+
+    for p in data_root.rglob("*.png"):
+        rel = str(p.relative_to(data_root)).replace("\\", "/")
+        by_rel[rel] = p
+        by_basename[p.name].append(p)
+
+    return by_rel, by_basename
+
+
+def resolve_row_path(row, data_root: Path, by_rel, by_basename) -> str | None:
+    """Try canonical path first, then fallback by basename if unique."""
+    rel_path = row["rel_path"]
+    canonical = data_root / rel_path
+    if canonical.exists():
+        return str(canonical)
+
+    if rel_path in by_rel:
+        return str(by_rel[rel_path])
+
+    name = Path(rel_path).name
+    matches = by_basename.get(name, [])
+    if len(matches) == 1:
+        return str(matches[0])
+
+    return None
 
 
 # -------------------------
@@ -109,19 +147,28 @@ def main():
     # build paths
     # -------------------------
     df["rel_path"] = df.apply(make_rel_path, axis=1)
-    df["path"] = df["rel_path"].apply(lambda p: str(data_root / p))
+
+    if args.strict_paths:
+        df["path"] = df["rel_path"].apply(lambda p: str(data_root / p))
+    else:
+        print("[INFO] building recursive image index (for robust path matching)...")
+        by_rel, by_basename = build_file_index(data_root)
+        print(f"[INFO] indexed png files: {len(by_rel)}")
+        df["path"] = df.apply(
+            lambda row: resolve_row_path(row, data_root, by_rel, by_basename), axis=1
+        )
 
     # check existence
-    exists = df["path"].apply(lambda p: Path(p).exists())
-    print(f"[INFO] existing image files: {exists.sum()} / {len(df)}")
+    exists = df["path"].apply(lambda p: isinstance(p, str) and Path(p).exists())
+    print(f"[INFO] resolved existing image files: {exists.sum()} / {len(df)}")
 
     if exists.sum() == 0:
         print("[WARN] 0 images found. Check --data_root")
-        print("[WARN] example path:", df["path"].iloc[0])
+        print("[WARN] example rel_path:", df["rel_path"].iloc[0])
     else:
-        missing = df.loc[~exists, "path"].head(5).tolist()
+        missing = df.loc[~exists, "rel_path"].head(5).tolist()
         if missing:
-            print("[INFO] example missing paths:")
+            print("[INFO] example unresolved rel_paths:")
             for m in missing:
                 print(" -", m)
 
