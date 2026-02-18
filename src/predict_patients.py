@@ -11,7 +11,7 @@ from tqdm import tqdm
 # ==========================================
 # 1. 核心路径配置
 # ==========================================
-MODEL_PATH = "runs/patch_classifier_phase1/resnet18_seed42/best.pth"
+MODEL_PATH = "/import2/hhome/ricse05/Deep-Learning-P1/runs/resnet18_seed42/best.pth"
 PATIENT_CSV = "/fhome/vlia/HelicoDataSet/PatientDiagnosis.csv"
 IMG_ROOT = "/fhome/vlia/HelicoDataSet"
 
